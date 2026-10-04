@@ -8,6 +8,7 @@ export type { FileData } from "./FileData.js";
 export type { ImageData } from "./ImageData.js";
 export type { LoginSubscriptionEvent } from "./LoginSubscriptionEvent.js";
 export type { MediaResult } from "./MediaResult.js";
+export type { MentionInfo } from "./MentionInfo.js";
 export type { Message } from "./Message.js";
 export type { OpenChatResult } from "./OpenChatResult.js";
 export type { ReplyInfo } from "./ReplyInfo.js";

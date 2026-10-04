@@ -406,6 +406,19 @@ pub struct ReplyInfo {
     pub content: String,
 }
 
+/// A user @-mentioned in a group message, resolved from the at-list in the
+/// message source XML (`<atuserlist>wxid1,wxid2</atuserlist>`).
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct MentionInfo {
+    pub wxid: String,
+    /// Display name resolved from contact.db (remark or nick name); absent for non-contacts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub display_name: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
@@ -435,6 +448,11 @@ pub struct Message {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub reply: Option<ReplyInfo>,
+    /// Everyone @-mentioned in this message (group chats only); `is_mentioned`
+    /// stays the "is the logged-in user among them" boolean.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub mentions: Option<Vec<MentionInfo>>,
 }
 
 // ============================================

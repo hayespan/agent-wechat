@@ -1,5 +1,5 @@
 use super::wechat_db::{get_db_path, query_wechat_db};
-use crate::ia::types::{Message, ReplyInfo};
+use crate::ia::types::{MentionInfo, Message, ReplyInfo};
 use md5::{Digest, Md5};
 use std::collections::HashMap;
 
@@ -163,18 +163,17 @@ pub(crate) fn extract_xml_tag(xml: &str, tag: &str) -> Option<String> {
     if val.is_empty() { None } else { Some(val) }
 }
 
-/// Check if the source XML indicates the current user is @-mentioned.
-fn check_is_mentioned(source: &str, account_dir: &str) -> bool {
-    if let Some(at_list) = extract_xml_tag(source, "atuserlist") {
-        // atuserlist may contain comma-separated wxids
-        for wxid in at_list.split(',') {
-            let wxid = wxid.trim();
-            if !wxid.is_empty() && account_dir.starts_with(wxid) {
-                return true;
-            }
-        }
-    }
-    false
+/// Parse the @-mentioned wxid list from message source XML.
+/// `<atuserlist>` holds comma-separated wxids.
+fn parse_at_list(source: &str) -> Vec<String> {
+    extract_xml_tag(source, "atuserlist")
+        .map(|list| {
+            list.split(',')
+                .map(|wxid| wxid.trim().to_string())
+                .filter(|wxid| !wxid.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Find which message DB contains a chat and return (db_name, key).
@@ -250,44 +249,22 @@ pub fn list_messages(
         ),
     );
 
-    // Resolve sender display names from contact.db
-    let contact_names: HashMap<String, String> = {
-        let mut map = HashMap::new();
-        if let Some(contact_key) = keys.get("contact.db") {
-            // Collect unique sender wxids
-            let senders: Vec<String> = rows.iter()
-                .filter_map(|row| {
-                    row.get("sender_name")
-                        .and_then(|v| v.as_str())
-                        .filter(|s| !s.is_empty())
-                        .map(|s| s.to_string())
-                })
-                .collect::<std::collections::HashSet<_>>()
-                .into_iter()
-                .collect();
+    // Pass 1: decode each row once, keeping everything the second pass needs —
+    // including the at-list, which lives in the source XML (or, for type-49
+    // appmsg such as reference/quote messages, sometimes in the content XML).
+    struct DecodedRow {
+        local_id: i64,
+        server_id: i64,
+        msg_type: i32,
+        sender: Option<String>,
+        content: String,
+        timestamp: String,
+        reply: Option<ReplyInfo>,
+        at_list: Vec<String>,
+    }
 
-            if !senders.is_empty() {
-                let contact_db = get_db_path(account_dir, "contact.db");
-                let placeholders = senders.iter().map(|s| format!("'{}'", s.replace('\'', "''"))).collect::<Vec<_>>().join(",");
-                let contacts = query_wechat_db(
-                    &contact_db,
-                    contact_key,
-                    &format!("SELECT username, nick_name, remark FROM contact WHERE username IN ({placeholders});"),
-                );
-                for c in contacts {
-                    if let Some(username) = c.get("username").and_then(|v| v.as_str()) {
-                        let name = c.get("remark").and_then(|v| v.as_str()).filter(|s| !s.is_empty())
-                            .or_else(|| c.get("nick_name").and_then(|v| v.as_str()).filter(|s| !s.is_empty()))
-                            .unwrap_or(username);
-                        map.insert(username.to_string(), name.to_string());
-                    }
-                }
-            }
-        }
-        map
-    };
-
-    rows.iter()
+    let decoded: Vec<DecodedRow> = rows
+        .iter()
         .filter_map(|row| {
             let local_id = row.get("local_id")?.as_i64()?;
             let server_id = row
@@ -341,8 +318,9 @@ pub fn list_messages(
                 })
                 .unwrap_or_default();
 
-            // Check @-mention from source XML (only for group chats)
-            let is_mentioned = if is_group {
+            // @-mention list (group chats only): source XML first; WeChat may
+            // place <atuserlist> inside the content XML for type-49 appmsg.
+            let at_list = if is_group {
                 let hex_source = row
                     .get("hex_source")
                     .and_then(|v| v.as_str())
@@ -353,49 +331,136 @@ pub fn list_messages(
                     .unwrap_or(0)
                     != 0;
                 let from_source = if !hex_source.is_empty() {
-                    let source_xml = decode_message_content(hex_source, source_compressed);
-                    check_is_mentioned(&source_xml, account_dir)
+                    parse_at_list(&decode_message_content(hex_source, source_compressed))
                 } else {
-                    false
+                    Vec::new()
                 };
-
-                // For type-49 (appmsg) messages — especially reference/quote messages —
-                // WeChat may place <atuserlist> inside the content XML instead of source.
-                let from_content = if !from_source && (msg_type & 0x7FFFFFFF) == 49 {
-                    check_is_mentioned(&body, account_dir)
+                if !from_source.is_empty() {
+                    from_source
+                } else if (msg_type & 0x7FFFFFFF) == 49 {
+                    parse_at_list(&body)
                 } else {
-                    false
-                };
-
-                if from_source || from_content {
-                    Some(true)
-                } else {
-                    None
+                    Vec::new()
                 }
+            } else {
+                Vec::new()
+            };
+
+            Some(DecodedRow {
+                local_id,
+                server_id,
+                msg_type,
+                sender,
+                content,
+                timestamp,
+                reply,
+                at_list,
+            })
+        })
+        .collect();
+
+    // Resolve display names from contact.db — covering senders and mentioned
+    // users alike, since mentioned users may not have spoken in this page.
+    let contact_names: HashMap<String, String> = {
+        let mut map = HashMap::new();
+        if let Some(contact_key) = keys.get("contact.db") {
+            let ids: Vec<String> = decoded
+                .iter()
+                .flat_map(|row| row.sender.iter().cloned().chain(row.at_list.iter().cloned()))
+                .filter(|s| !s.is_empty())
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .collect();
+
+            if !ids.is_empty() {
+                let contact_db = get_db_path(account_dir, "contact.db");
+                let placeholders = ids.iter().map(|s| format!("'{}'", s.replace('\'', "''"))).collect::<Vec<_>>().join(",");
+                let contacts = query_wechat_db(
+                    &contact_db,
+                    contact_key,
+                    &format!("SELECT username, nick_name, remark FROM contact WHERE username IN ({placeholders});"),
+                );
+                for c in contacts {
+                    if let Some(username) = c.get("username").and_then(|v| v.as_str()) {
+                        let name = c.get("remark").and_then(|v| v.as_str()).filter(|s| !s.is_empty())
+                            .or_else(|| c.get("nick_name").and_then(|v| v.as_str()).filter(|s| !s.is_empty()))
+                            .unwrap_or(username);
+                        map.insert(username.to_string(), name.to_string());
+                    }
+                }
+            }
+        }
+        map
+    };
+
+    // Pass 2: build the public Message values.
+    decoded
+        .into_iter()
+        .map(|row| {
+            let is_mentioned = if row.at_list.iter().any(|wxid| account_dir.starts_with(wxid.as_str())) {
+                Some(true)
             } else {
                 None
             };
+            let mentions = if row.at_list.is_empty() {
+                None
+            } else {
+                Some(
+                    row.at_list
+                        .iter()
+                        .map(|wxid| MentionInfo {
+                            wxid: wxid.clone(),
+                            display_name: contact_names.get(wxid).cloned(),
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            };
 
             // Check if message was sent by the logged-in user
-            let is_self = sender.as_ref().map(|s| account_dir.starts_with(s.as_str()));
+            let is_self = row.sender.as_ref().map(|s| account_dir.starts_with(s.as_str()));
 
-            let sender_name = sender.as_ref()
+            let sender_name = row.sender.as_ref()
                 .and_then(|wxid| contact_names.get(wxid))
                 .cloned();
 
-            Some(Message {
-                local_id,
-                server_id,
+            Message {
+                local_id: row.local_id,
+                server_id: row.server_id,
                 chat_id: chat_id.to_string(),
-                sender,
+                sender: row.sender,
                 sender_name,
-                msg_type,
-                content,
-                timestamp,
+                msg_type: row.msg_type,
+                content: row.content,
+                timestamp: row.timestamp,
                 is_mentioned,
                 is_self,
-                reply,
-            })
+                reply: row.reply,
+                mentions,
+            }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_at_list_reads_comma_separated_wxids() {
+        let xml = r#"<msgsource><atuserlist>wxid_aaa,wxid_bbb</atuserlist></msgsource>"#;
+        assert_eq!(parse_at_list(xml), vec!["wxid_aaa", "wxid_bbb"]);
+    }
+
+    #[test]
+    fn parse_at_list_tolerates_spaces_and_cdata() {
+        let xml = r#"<msgsource><atuserlist><![CDATA[ wxid_aaa , wxid_bbb ]]></atuserlist></msgsource>"#;
+        assert_eq!(parse_at_list(xml), vec!["wxid_aaa", "wxid_bbb"]);
+    }
+
+    #[test]
+    fn parse_at_list_missing_tag_is_empty() {
+        assert!(parse_at_list("<msgsource/>").is_empty());
+        assert!(parse_at_list("").is_empty());
+        assert!(parse_at_list(r#"<msgsource><atuserlist></atuserlist></msgsource>"#).is_empty());
+    }
 }
